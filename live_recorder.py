@@ -14,518 +14,270 @@ import os
 import signal
 import sys
 import configparser
+import threading
 from datetime import datetime
-from typing import Optional, Dict, Any, List
-
+from typing import Optional, Dict, Any
 
 class BilibiliLiveRecorder:
     def __init__(self, config_file: str = "config.ini"):
-        """
-        初始化录播器
-        
-        Args:
-            config_file: 配置文件路径
-        """
         self.config_file = config_file
         self.config = self.load_config()
-        
-        # 从配置文件读取设置
         self.room_ids = self.config.get('rooms', 'room_ids', fallback='').split(',')
         self.room_ids = [rid.strip() for rid in self.room_ids if rid.strip()]
-        
         self.output_dir = self.config.get('settings', 'output_dir', fallback='./recordings')
         self.cookies = self.config.get('auth', 'cookies', fallback='')
-        
-        # 录制相关设置
         self.check_interval = self.config.getint('settings', 'check_interval', fallback=30)
         self.retry_delay = self.config.getint('settings', 'retry_delay', fallback=60)
         self.quality = self.config.getint('settings', 'quality', fallback=25000)
-        
-        # 活动录制进程
-        self.recording_processes = {}  # room_id -> process info
-        
-        # 设置ffmpeg路径
+        self.recording_processes = {}
+        self.process_lock = threading.Lock()
+        self.stop_event = threading.Event()
         self.ffmpeg_path = self.get_ffmpeg_path()
-        
-        # 创建输出目录
         os.makedirs(self.output_dir, exist_ok=True)
-        
-        # 设置信号处理器
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
-    
+
     def get_ffmpeg_path(self) -> str:
-        """
-        获取ffmpeg可执行文件路径
-        优先使用同目录下的ffmpeg，然后使用系统PATH中的ffmpeg
-        
-        Returns:
-            ffmpeg可执行文件路径
-        """
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        # 根据操作系统确定可执行文件名
-        if os.name == 'nt':  # Windows
-            local_ffmpeg = os.path.join(script_dir, 'ffmpeg.exe')
-        else:  # Linux/macOS
-            local_ffmpeg = os.path.join(script_dir, 'ffmpeg')
-        
-        # 检查同目录下是否有ffmpeg
+        local_ffmpeg = os.path.join(script_dir, 'ffmpeg')
         if os.path.isfile(local_ffmpeg) and os.access(local_ffmpeg, os.X_OK):
             print(f"使用本地ffmpeg: {local_ffmpeg}")
             return local_ffmpeg
-        
-        # 检查系统PATH中是否有ffmpeg
         try:
-            # 使用which命令（Linux/macOS）或where命令（Windows）查找ffmpeg
             if os.name == 'nt':
-                result = subprocess.run(['where', 'ffmpeg'], capture_output=True, text=True)
+                result = subprocess.run(['where', 'ffmpeg'], capture_output=True, text=True, check=True)
             else:
-                result = subprocess.run(['which', 'ffmpeg'], capture_output=True, text=True)
-            
-            if result.returncode == 0 and result.stdout.strip():
-                system_ffmpeg = result.stdout.strip().split('\n')[0]  # 取第一个结果
-                print(f"使用系统ffmpeg: {system_ffmpeg}")
-                return system_ffmpeg
-        except Exception as e:
-            print(f"检查系统ffmpeg时出错: {e}")
-        
-        # 如果都找不到，返回默认的ffmpeg（让系统报错）
-        print("警告: 未找到ffmpeg可执行文件")
-        print("请确保:")
-        print("1. 将ffmpeg可执行文件放在脚本同目录下，或")
-        print("2. 安装ffmpeg并确保在系统PATH中")
-        return 'ffmpeg'
-    
+                result = subprocess.run(['which', 'ffmpeg'], capture_output=True, text=True, check=True)
+            system_ffmpeg = result.stdout.strip().split('\n')[0]
+            print(f"使用系统ffmpeg: {system_ffmpeg}")
+            return system_ffmpeg
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("警告: 未找到ffmpeg可执行文件")
+            print("请确保:\n1. 将ffmpeg可执行文件放在脚本同目录下，或\n2. 安装ffmpeg并确保在系统PATH中")
+            return 'ffmpeg'
+
     def load_config(self) -> configparser.ConfigParser:
-        """加载配置文件"""
-        # 禁用插值功能，避免cookie中的%符号被误解析
         config = configparser.ConfigParser(interpolation=None)
-        
         if not os.path.exists(self.config_file):
             print(f"配置文件 {self.config_file} 不存在，正在创建默认配置...")
             self.create_default_config()
-        
         config.read(self.config_file, encoding='utf-8')
         return config
-    
+
     def create_default_config(self):
-        """创建默认配置文件"""
-        # 同样禁用插值功能
         config = configparser.ConfigParser(interpolation=None)
-        
-        # 认证配置
-        config.add_section('auth')
-        config.set('auth', 'cookies', '')
-        
-        # 直播间配置
-        config.add_section('rooms')
-        config.set('rooms', 'room_ids', '30931147')
-        
-        # 设置配置
-        config.add_section('settings')
-        config.set('settings', 'output_dir', './recordings')
-        config.set('settings', 'check_interval', '30')
-        config.set('settings', 'retry_delay', '60')
-        config.set('settings', 'quality', '25000')
-        
-        # 质量说明
-        config.add_section('quality_info')
-        config.set('quality_info', '# 画质选项说明')
-        config.set('quality_info', '# 30000 - 杜比')
-        config.set('quality_info', '# 25000 - 原画真彩/4K')
-        config.set('quality_info', '# 20000 - 4K')
-        config.set('quality_info', '# 10000 - 原画/1080P高码率')
-        config.set('quality_info', '# 400 - 蓝光/1080P')
-        config.set('quality_info', '# 250 - 超清/720P')
-        config.set('quality_info', '# 150 - 高清')
-        config.set('quality_info', '# 80 - 流畅')
-        
-        with open(self.config_file, 'w', encoding='utf-8') as f:
-            config.write(f)
-        
-        print(f"已创建默认配置文件: {self.config_file}")
-        print("请编辑配置文件填入必要信息后重新运行")
-        print("\n重要提示:")
-        print("1. 在 [auth] 部分填入B站cookies（用于获取高画质流）")
-        print("2. 在 [rooms] 部分填入要录制的直播间号，多个用逗号分隔")
-        print("3. 可选：调整 [settings] 部分的其他参数")
-        print("\n注意：cookies中包含%符号是正常的，无需转义")
-        sys.exit(0)
-    
+        config.add_section('auth'); config.set('auth', 'cookies', '')
+        config.add_section('rooms'); config.set('rooms', 'room_ids', '30931147')
+        config.add_section('settings'); config.set('settings', 'output_dir', './recordings'); config.set('settings', 'check_interval', '30'); config.set('settings', 'retry_delay', '60'); config.set('settings', 'quality', '25000')
+        config.add_section('quality_info'); config.set('quality_info', '# 画质选项说明', '# 30000 - 杜比\n# 25000 - 原画真彩/4K\n# 20000 - 4K\n# 10000 - 原画/1080P高码率\n# 400 - 蓝光/1080P\n# 250 - 超清/720P\n# 150 - 高清\n# 80 - 流畅')
+        with open(self.config_file, 'w', encoding='utf-8') as f: config.write(f)
+        print(f"已创建默认配置文件: {self.config_file}"); print("请编辑配置文件填入必要信息后重新运行"); sys.exit(0)
+
     def _signal_handler(self, signum, frame):
-        """处理中断信号"""
         print("\n收到退出信号，正在停止所有录制...")
+        self.stop_event.set()
         self.stop_all_recordings()
         sys.exit(0)
-    
+
     def parse_cookies(self, cookie_string: str) -> Dict[str, str]:
-        """解析cookie字符串"""
-        cookies = {}
-        if not cookie_string:
-            return cookies
-        
+        cookies = {};
+        if not cookie_string: return cookies
         for item in cookie_string.split(';'):
             item = item.strip()
-            if '=' in item:
-                key, value = item.split('=', 1)
-                cookies[key.strip()] = value.strip()
-        
+            if '=' in item: key, value = item.split('=', 1); cookies[key.strip()] = value.strip()
         return cookies
     
     def get_live_stream_url(self, room_id: str) -> Optional[str]:
-        """
-        获取直播流URL
-        
-        Args:
-            room_id: 直播间ID
-            
-        Returns:
-            直播流URL，如果获取失败返回None
-        """
         api_url = f"https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo"
-        params = {
-            'room_id': room_id,
-            'no_playurl': 0,
-            'mask': 1,
-            'qn': self.quality,
-            'platform': 'web',
-            'protocol': '0,1',
-            'format': '0,1,2',
-            'codec': '0,1,2',
-            'dolby': 5,
-            'panorama': 1,
-            'hdr_type': '0,1'
-        }
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Referer': f'https://live.bilibili.com/{room_id}',
-            'Origin': 'https://live.bilibili.com'
-        }
-        
-        # 添加cookies
+        params = {'room_id': room_id, 'no_playurl': 0, 'mask': 1, 'qn': self.quality, 'platform': 'web', 'protocol': '0,1', 'format': '0,1,2', 'codec': '0,1,2', 'dolby': 5, 'panorama': 1, 'hdr_type': '0,1'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36', 'Referer': f'https://live.bilibili.com/{room_id}', 'Origin': 'https://live.bilibili.com'}
         cookies = self.parse_cookies(self.cookies)
-        
         try:
             print(f"正在获取直播间 {room_id} 的流信息...")
-            response = requests.get(
-                api_url, 
-                params=params, 
-                headers=headers, 
-                cookies=cookies,
-                timeout=10
-            )
+            response = requests.get(api_url, params=params, headers=headers, cookies=cookies, timeout=10)
             response.raise_for_status()
-            
             data = response.json()
-            
-            if data['code'] != 0:
-                print(f"API返回错误 (房间{room_id}): {data.get('message', '未知错误')}")
-                return None
-            
-            # 检查直播状态
-            live_status = data['data'].get('live_status', 0)
-            if live_status != 1:
-                print(f"直播间 {room_id} 当前未开播 (状态: {live_status})")
-                return None
-            
-            # 解析流URL
+            if data['code'] != 0: print(f"API返回错误 (房间{room_id}): {data.get('message', '未知错误')}"); return None
+            if data['data'].get('live_status', 0) != 1: print(f"直播间 {room_id} 当前未开播"); return None
             playurl_info = data['data'].get('playurl_info')
-            if not playurl_info:
-                print(f"房间 {room_id}: 未找到播放信息")
-                return None
-            
-            playurl = playurl_info.get('playurl')
-            if not playurl or not playurl.get('stream'):
-                print(f"房间 {room_id}: 未找到流信息")
-                return None
-            
-            # 获取第一个可用的流
-            stream = playurl['stream'][0]
-            format_info = stream['format'][0]
-            codec_info = format_info['codec'][0]
-            
-            # 拼接完整的流URL
-            host = codec_info['url_info'][0]['host']
-            base_url = codec_info['base_url']
-            extra = codec_info['url_info'][0]['extra']
-            
-            stream_url = f"{host}{base_url}{extra}"
-            
-            # 获取画质信息
-            current_qn = codec_info.get('current_qn', 'unknown')
-            qn_desc = next((q['desc'] for q in playurl.get('g_qn_desc', []) if q['qn'] == current_qn), str(current_qn))
-            
-            print(f"房间 {room_id} 获取到流URL (画质: {qn_desc}): {stream_url}")
+            if not playurl_info or not playurl_info.get('playurl') or not playurl_info['playurl'].get('stream'): print(f"房间 {room_id}: 未找到流信息"); return None
+            stream = playurl_info['playurl']['stream'][1]
+            codec_info = stream['format'][0]['codec'][0]
+            stream_url = f"{codec_info['url_info'][0]['host']}{codec_info['base_url']}{codec_info['url_info'][0]['extra']}"
+            current_qn = codec_info.get('current_qn', 'unknown'); qn_desc = next((q['desc'] for q in playurl_info['playurl'].get('g_qn_desc', []) if q['qn'] == current_qn), str(current_qn))
+            print(f"房间 {room_id} 获取到流URL (画质: {qn_desc})")
             return stream_url
-            
-        except requests.RequestException as e:
-            print(f"房间 {room_id} 网络请求失败: {e}")
-            return None
-        except (KeyError, IndexError, json.JSONDecodeError) as e:
-            print(f"房间 {room_id} 解析响应数据失败: {e}")
-            return None
-    
+        except Exception as e: print(f"房间 {room_id} 网络或解析失败: {e}"); return None
+
+    def _stderr_reader_thread(self, room_id: str, process: subprocess.Popen):
+        """
+        [MODIFIED] 这是一个专门用于读取并丢弃单个ffmpeg进程的stderr的线程。
+        它的唯一目的是防止管道缓冲区被填满导致进程阻塞。
+        """
+        # 持续从管道中读取数据，但不对其做任何处理（pass）
+        for line in process.stderr:
+            line.strip()
+        # for line in process.stderr:
+        #     # 简单打印，可以根据需要进行更复杂的处理，如解析进度
+        #     print(f"[ffmpeg][{room_id}]: {line.strip()}", flush=True)
+        # 当循环结束（进程退出），这条信息可选，用于确认线程已正常退出
+        # print(f"房间 {room_id} 的ffmpeg日志读取线程已正常结束。")
+
+
+
+
+
     def start_recording(self, room_id: str, stream_url: str) -> bool:
-        """
-        开始录制
-        
-        Args:
-            room_id: 直播间ID
-            stream_url: 直播流URL
-            
-        Returns:
-            是否成功启动录制
-        """
-        if room_id in self.recording_processes:
-            print(f"房间 {room_id} 已经在录制中")
-            return False
-        
-        # 生成输出文件名
+        print(f"DEBUG: Entering start_recording for room {room_id}", flush=True) # 强制刷新
+        with self.process_lock:
+            if room_id in self.recording_processes:
+                print(f"房间 {room_id} 已经在录制中")
+                return False
+    
+    
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_file = os.path.join(self.output_dir, f"live_{room_id}_{timestamp}.flv")
+    
         
-        # ffmpeg命令
+        # 即使不打印，-loglevel quiet 也能减少ffmpeg进程的IO负载，是个好习惯
         ffmpeg_cmd = [
-            self.ffmpeg_path,  # 使用检测到的ffmpeg路径
-            '-i', stream_url,
-            '-c', 'copy',  # 直接复制流，不重新编码
-            '-f', 'flv',   # 输出格式为flv
-            '-y',          # 覆盖输出文件
-            '-reconnect', '1',
-            '-reconnect_streamed', '1',
-            '-reconnect_delay_max', '30',
-            output_file
+            self.ffmpeg_path, '-hide_banner', 
+            '-i', stream_url, 
+            '-c', 'copy', 
+            '-y', output_file,
         ]
         
         try:
             print(f"开始录制房间 {room_id} 到文件: {output_file}")
-            
-            # 启动ffmpeg进程
             process = subprocess.Popen(
-                ffmpeg_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
+                ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True
             )
             
-            self.recording_processes[room_id] = {
-                'process': process,
-                'output_file': output_file,
-                'start_time': datetime.now()
-            }
+            reader_thread = threading.Thread(
+                target=self._stderr_reader_thread, 
+                args=(room_id, process), 
+                daemon=True
+            )
+            reader_thread.start()
+            
+            with self.process_lock:
+                self.recording_processes[room_id] = {
+                    'process': process, 'output_file': output_file, 'start_time': datetime.now()
+                }
             
             print(f"房间 {room_id} 录制已开始 (PID: {process.pid})")
             return True
-            
         except FileNotFoundError:
             print(f"错误: 未找到ffmpeg可执行文件: {self.ffmpeg_path}")
-            print("请确保ffmpeg已正确安装或放置在脚本同目录下")
             return False
         except Exception as e:
             print(f"房间 {room_id} 启动录制失败: {e}")
             return False
-    
+
     def stop_recording(self, room_id: str):
-        """停止指定房间的录制"""
-        if room_id not in self.recording_processes:
-            return
+        with self.process_lock:
+            if room_id not in self.recording_processes: return
+            process_info = self.recording_processes.pop(room_id)
         
-        process_info = self.recording_processes[room_id]
         process = process_info['process']
-        
         print(f"正在停止房间 {room_id} 的录制...")
-        
         try:
-            # 发送SIGINT信号给ffmpeg进程
             process.send_signal(signal.SIGINT)
-            
-            # 等待进程结束
             process.wait(timeout=10)
-            
         except subprocess.TimeoutExpired:
             print(f"强制终止房间 {room_id} 的录制进程...")
-            process.kill()
-            process.wait()
-        except Exception as e:
-            print(f"停止房间 {room_id} 录制时出错: {e}")
+            process.kill(); process.wait()
+        except Exception as e: print(f"停止房间 {room_id} 录制时出错: {e}")
         
-        # 计算录制时长
         duration = datetime.now() - process_info['start_time']
         print(f"房间 {room_id} 录制已停止，持续时间: {duration}")
-        
-        del self.recording_processes[room_id]
-    
+
     def stop_all_recordings(self):
-        """停止所有录制"""
-        room_ids = list(self.recording_processes.keys())
+        with self.process_lock:
+            room_ids = list(self.recording_processes.keys())
         for room_id in room_ids:
             self.stop_recording(room_id)
-    
-    def check_recording_status(self, room_id: str) -> bool:
-        """
-        检查指定房间的录制状态
-        
-        Args:
-            room_id: 直播间ID
+
+    def _status_monitor_thread(self):
+        print("录制状态监控线程已启动。")
+        while not self.stop_event.is_set():
+            with self.process_lock:
+                if not self.recording_processes:
+                    self.stop_event.wait(1)
+                    continue
+                room_ids_to_check = list(self.recording_processes.keys())
+
+            for room_id in room_ids_to_check:
+                process = None
+                with self.process_lock:
+                    if room_id in self.recording_processes:
+                        process = self.recording_processes[room_id]['process']
+                
+                if process and process.poll() is not None:
+                    print(f"监控线程发现房间 {room_id} 录制已停止 (返回码: {process.returncode})")
+                    with self.process_lock:
+                        if room_id in self.recording_processes:
+                            del self.recording_processes[room_id]
             
-        Returns:
-            录制是否正在进行
-        """
-        if room_id not in self.recording_processes:
-            return False
-        
-        process_info = self.recording_processes[room_id]
-        process = process_info['process']
-        
-        # 检查进程是否还在运行
-        poll = process.poll()
-        if poll is not None:
-            # 进程已结束
-            print(f"房间 {room_id} 录制进程已结束 (返回码: {poll})")
-            
-            # 打印stderr信息
-            if process.stderr:
-                stderr_output = process.stderr.read()
-                if stderr_output:
-                    print(f"房间 {room_id} ffmpeg错误信息: {stderr_output}")
-            
-            del self.recording_processes[room_id]
-            return False
-        
-        return True
-    
+            self.stop_event.wait(1)
+        print("录制状态监控线程已停止。")
+
     def get_room_info(self, room_id: str) -> Dict[str, Any]:
-        """获取房间信息"""
         api_url = "https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom"
-        params = {'room_id': room_id}
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': f'https://live.bilibili.com/{room_id}'
-        }
+        params = {'room_id': room_id}; headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Referer': f'https://live.bilibili.com/{room_id}'}
         cookies = self.parse_cookies(self.cookies)
-        
         try:
-            response = requests.get(api_url, params=params, headers=headers, cookies=cookies, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
+            response = requests.get(api_url, params=params, headers=headers, cookies=cookies, timeout=10); response.raise_for_status(); data = response.json()
             if data['code'] == 0:
-                room_info = data['data']['room_info']
-                anchor_info = data['data']['anchor_info']
-                return {
-                    'title': room_info.get('title', '未知'),
-                    'uname': anchor_info.get('base_info', {}).get('uname', '未知'),
-                    'live_status': room_info.get('live_status', 0)
-                }
-        except Exception as e:
-            print(f"获取房间 {room_id} 信息失败: {e}")
-        
+                room_info = data['data']['room_info']; anchor_info = data['data']['anchor_info']
+                return {'title': room_info.get('title', '未知'), 'uname': anchor_info.get('base_info', {}).get('uname', '未知'), 'live_status': room_info.get('live_status', 0)}
+        except Exception as e: print(f"获取房间 {room_id} 信息失败: {e}")
         return {'title': '未知', 'uname': '未知', 'live_status': 0}
-    
+
     def check_ffmpeg_version(self):
-        """检查ffmpeg版本"""
         try:
-            result = subprocess.run(
-                [self.ffmpeg_path, '-version'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if result.returncode == 0:
-                # 提取版本信息
-                first_line = result.stdout.split('\n')[0]
-                print(f"ffmpeg版本: {first_line}")
-            else:
-                print(f"警告: 无法获取ffmpeg版本信息")
-        except subprocess.TimeoutExpired:
-            print("警告: ffmpeg版本检查超时")
-        except Exception as e:
-            print(f"警告: 检查ffmpeg版本时出错: {e}")
+            result = subprocess.run([self.ffmpeg_path, '-version'], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0: print(f"ffmpeg版本: {result.stdout.splitlines()[0]}")
+            else: print(f"警告: 无法获取ffmpeg版本信息")
+        except Exception as e: print(f"警告: 检查ffmpeg版本时出错: {e}")
         print()
-    
+
     def run(self):
-        """运行录制循环"""
         if not self.room_ids:
-            print("错误: 配置文件中未设置直播间号")
-            return
+            print("错误: 配置文件中未设置直播间号"); return
         
-        # 检查ffmpeg版本
         self.check_ffmpeg_version()
+        monitor = threading.Thread(target=self._status_monitor_thread, daemon=True); monitor.start()
         
-        print(f"开始监控 {len(self.room_ids)} 个直播间")
-        print(f"录制文件将保存到: {os.path.abspath(self.output_dir)}")
-        print(f"检查间隔: {self.check_interval}秒")
-        print(f"重试延迟: {self.retry_delay}秒")
-        print("按Ctrl+C停止录制\n")
+        print(f"开始监控 {len(self.room_ids)} 个直播间...")
         
-        # 显示房间信息
-        for room_id in self.room_ids:
-            info = self.get_room_info(room_id)
-            status_text = "直播中" if info['live_status'] == 1 else "未开播"
-            print(f"房间 {room_id}: {info['uname']} - {info['title']} [{status_text}]")
-        print()
-        
-        while True:
+        while not self.stop_event.is_set():
             try:
-                # 检查每个房间
                 for room_id in self.room_ids:
-                    # 如果当前没在录制该房间，尝试获取流URL并开始录制
-                    if room_id not in self.recording_processes:
+                    with self.process_lock:
+                        is_recording = room_id in self.recording_processes
+                    if not is_recording:
                         stream_url = self.get_live_stream_url(room_id)
                         if stream_url:
                             self.start_recording(room_id, stream_url)
-                    else:
-                        # 检查录制状态
-                        if not self.check_recording_status(room_id):
-                            print(f"房间 {room_id} 录制已停止，准备重新开始...")
                 
-                # 显示当前录制状态
-                if self.recording_processes:
-                    print(f"当前录制中的房间: {', '.join(self.recording_processes.keys())}")
-                
-                # 等待下次检查
-                time.sleep(self.check_interval)
-                
-            except KeyboardInterrupt:
-                break
+                self.stop_event.wait(self.check_interval)
             except Exception as e:
-                print(f"运行时出错: {e}")
-                time.sleep(self.retry_delay)
+                print(f"主循环运行时出错: {e}")
+                self.stop_event.wait(self.retry_delay)
         
-        # 清理
+        print("主循环已退出，等待所有进程结束...")
         self.stop_all_recordings()
+        monitor.join(timeout=5)
         print("录制器已停止")
 
-
 def main():
-    """主函数"""
     import argparse
-    
     parser = argparse.ArgumentParser(description='B站直播录制工具')
-    parser.add_argument('-c', '--config', default='config.ini',
-                       help='配置文件路径 (默认: config.ini)')
-    parser.add_argument('--show-config', action='store_true',
-                       help='显示当前配置')
-    
+    parser.add_argument('-c', '--config', default='config.ini', help='配置文件路径 (默认: config.ini)')
     args = parser.parse_args()
-    
-    if args.show_config:
-        if os.path.exists(args.config):
-            with open(args.config, 'r', encoding='utf-8') as f:
-                print(f"配置文件 {args.config} 内容:")
-                print(f.read())
-        else:
-            print(f"配置文件 {args.config} 不存在")
-        return
-    
-    # 创建录制器
     recorder = BilibiliLiveRecorder(args.config)
-    
-    # 开始录制
     recorder.run()
-
 
 if __name__ == '__main__':
     main()
