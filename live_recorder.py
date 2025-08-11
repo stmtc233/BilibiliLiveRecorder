@@ -44,6 +44,9 @@ class BilibiliLiveRecorder:
         # 活动录制进程
         self.recording_processes = {}  # room_id -> process info
         
+        # 设置ffmpeg路径
+        self.ffmpeg_path = self.get_ffmpeg_path()
+        
         # 创建输出目录
         os.makedirs(self.output_dir, exist_ok=True)
         
@@ -51,9 +54,53 @@ class BilibiliLiveRecorder:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
     
+    def get_ffmpeg_path(self) -> str:
+        """
+        获取ffmpeg可执行文件路径
+        优先使用同目录下的ffmpeg，然后使用系统PATH中的ffmpeg
+        
+        Returns:
+            ffmpeg可执行文件路径
+        """
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # 根据操作系统确定可执行文件名
+        if os.name == 'nt':  # Windows
+            local_ffmpeg = os.path.join(script_dir, 'ffmpeg.exe')
+        else:  # Linux/macOS
+            local_ffmpeg = os.path.join(script_dir, 'ffmpeg')
+        
+        # 检查同目录下是否有ffmpeg
+        if os.path.isfile(local_ffmpeg) and os.access(local_ffmpeg, os.X_OK):
+            print(f"使用本地ffmpeg: {local_ffmpeg}")
+            return local_ffmpeg
+        
+        # 检查系统PATH中是否有ffmpeg
+        try:
+            # 使用which命令（Linux/macOS）或where命令（Windows）查找ffmpeg
+            if os.name == 'nt':
+                result = subprocess.run(['where', 'ffmpeg'], capture_output=True, text=True)
+            else:
+                result = subprocess.run(['which', 'ffmpeg'], capture_output=True, text=True)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                system_ffmpeg = result.stdout.strip().split('\n')[0]  # 取第一个结果
+                print(f"使用系统ffmpeg: {system_ffmpeg}")
+                return system_ffmpeg
+        except Exception as e:
+            print(f"检查系统ffmpeg时出错: {e}")
+        
+        # 如果都找不到，返回默认的ffmpeg（让系统报错）
+        print("警告: 未找到ffmpeg可执行文件")
+        print("请确保:")
+        print("1. 将ffmpeg可执行文件放在脚本同目录下，或")
+        print("2. 安装ffmpeg并确保在系统PATH中")
+        return 'ffmpeg'
+    
     def load_config(self) -> configparser.ConfigParser:
         """加载配置文件"""
-        config = configparser.ConfigParser()
+        # 禁用插值功能，避免cookie中的%符号被误解析
+        config = configparser.ConfigParser(interpolation=None)
         
         if not os.path.exists(self.config_file):
             print(f"配置文件 {self.config_file} 不存在，正在创建默认配置...")
@@ -64,7 +111,8 @@ class BilibiliLiveRecorder:
     
     def create_default_config(self):
         """创建默认配置文件"""
-        config = configparser.ConfigParser()
+        # 同样禁用插值功能
+        config = configparser.ConfigParser(interpolation=None)
         
         # 认证配置
         config.add_section('auth')
@@ -102,6 +150,7 @@ class BilibiliLiveRecorder:
         print("1. 在 [auth] 部分填入B站cookies（用于获取高画质流）")
         print("2. 在 [rooms] 部分填入要录制的直播间号，多个用逗号分隔")
         print("3. 可选：调整 [settings] 部分的其他参数")
+        print("\n注意：cookies中包含%符号是正常的，无需转义")
         sys.exit(0)
     
     def _signal_handler(self, signum, frame):
@@ -208,7 +257,7 @@ class BilibiliLiveRecorder:
             current_qn = codec_info.get('current_qn', 'unknown')
             qn_desc = next((q['desc'] for q in playurl.get('g_qn_desc', []) if q['qn'] == current_qn), str(current_qn))
             
-            print(f"房间 {room_id} 获取到流URL (画质: {qn_desc}): {stream_url[:100]}...")
+            print(f"房间 {room_id} 获取到流URL (画质: {qn_desc}): {stream_url}")
             return stream_url
             
         except requests.RequestException as e:
@@ -239,7 +288,7 @@ class BilibiliLiveRecorder:
         
         # ffmpeg命令
         ffmpeg_cmd = [
-            'ffmpeg',
+            self.ffmpeg_path,  # 使用检测到的ffmpeg路径
             '-i', stream_url,
             '-c', 'copy',  # 直接复制流，不重新编码
             '-f', 'flv',   # 输出格式为flv
@@ -271,7 +320,8 @@ class BilibiliLiveRecorder:
             return True
             
         except FileNotFoundError:
-            print("错误: 未找到ffmpeg，请确保ffmpeg已安装并在PATH中")
+            print(f"错误: 未找到ffmpeg可执行文件: {self.ffmpeg_path}")
+            print("请确保ffmpeg已正确安装或放置在脚本同目录下")
             return False
         except Exception as e:
             print(f"房间 {room_id} 启动录制失败: {e}")
@@ -339,7 +389,7 @@ class BilibiliLiveRecorder:
             if process.stderr:
                 stderr_output = process.stderr.read()
                 if stderr_output:
-                    print(f"房间 {room_id} ffmpeg错误信息: {stderr_output[:500]}...")
+                    print(f"房间 {room_id} ffmpeg错误信息: {stderr_output}")
             
             del self.recording_processes[room_id]
             return False
@@ -374,11 +424,35 @@ class BilibiliLiveRecorder:
         
         return {'title': '未知', 'uname': '未知', 'live_status': 0}
     
+    def check_ffmpeg_version(self):
+        """检查ffmpeg版本"""
+        try:
+            result = subprocess.run(
+                [self.ffmpeg_path, '-version'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                # 提取版本信息
+                first_line = result.stdout.split('\n')[0]
+                print(f"ffmpeg版本: {first_line}")
+            else:
+                print(f"警告: 无法获取ffmpeg版本信息")
+        except subprocess.TimeoutExpired:
+            print("警告: ffmpeg版本检查超时")
+        except Exception as e:
+            print(f"警告: 检查ffmpeg版本时出错: {e}")
+        print()
+    
     def run(self):
         """运行录制循环"""
         if not self.room_ids:
             print("错误: 配置文件中未设置直播间号")
             return
+        
+        # 检查ffmpeg版本
+        self.check_ffmpeg_version()
         
         print(f"开始监控 {len(self.room_ids)} 个直播间")
         print(f"录制文件将保存到: {os.path.abspath(self.output_dir)}")
